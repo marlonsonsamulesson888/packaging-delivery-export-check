@@ -59,7 +59,11 @@ def read_ai(path, page=0, box="mediabox"):
         import fitz  # type: ignore
     doc = fitz.open(path)
     info["pages"] = len(doc)
-    pg = doc[min(page, len(doc) - 1)]
+    if isinstance(page, bool) or not isinstance(page, int) or not 0 <= page < len(doc):
+        doc.close()
+        raise ValueError("page 必须是范围内的零基页码")
+    info["page"] = page
+    pg = doc[page]
     r = getattr(pg, box)
     info["artboard_box"] = box
     info["artboard_mm"] = [round(r.width * PT2MM, 2), round(r.height * PT2MM, 2)]
@@ -102,7 +106,35 @@ def check_jpg(path, artboard_mm, dpi=300, tol_px=1):
             "checks": checks}
 
 
-def check_package(folder, dpi=300, expect_ai=1, expect_jpg=1, tol_px=1):
+def validate_pairs(pairs, folder, ais, jpgs, ai_reports):
+    """Explicit relative-path mapping: every JPG and readable AI page exactly once."""
+    if not isinstance(pairs, list):
+        raise ValueError("pairs 必须是数组")
+    ai_by_name = {p.relative_to(folder).as_posix(): (p, r) for p, r in zip(ais, ai_reports)}
+    jpg_by_name = {p.relative_to(folder).as_posix(): p for p in jpgs}
+    seen_jpg, seen_page, resolved = set(), set(), []
+    for pair in pairs:
+        if not isinstance(pair, dict) or set(pair) != {"ai", "page", "jpg"}:
+            raise ValueError("每条配对必须且只能含 ai、page、jpg")
+        a, page, j = pair["ai"], pair["page"], pair["jpg"]
+        if not isinstance(a, str) or not isinstance(j, str) or a not in ai_by_name or j not in jpg_by_name:
+            raise ValueError("配对路径必须是目录内实际 AI/JPG 的相对路径（/ 分隔）")
+        info = ai_by_name[a][1]
+        if isinstance(page, bool) or not isinstance(page, int) or not 0 <= page < info.get("pages", 0):
+            raise ValueError("配对页码越界或 AI 不可读；page 使用零基整数")
+        if j in seen_jpg or (a, page) in seen_page:
+            raise ValueError("重复 JPG 或重复 AI 画板配对")
+        seen_jpg.add(j); seen_page.add((a, page))
+        resolved.append((jpg_by_name[j], ai_by_name[a][0], page))
+    expected = {(a, page) for a, (_, r) in ai_by_name.items() for page in range(r.get("pages", 0))}
+    if any("pages" not in r for _, r in ai_by_name.values()):
+        raise ValueError("存在不可读 AI，不能确认完整画板覆盖")
+    if seen_jpg != set(jpg_by_name) or seen_page != expected:
+        raise ValueError("配对覆盖不完整：每个 JPG 和每个 AI 画板必须恰好配对一次")
+    return resolved
+
+
+def check_package(folder, dpi=300, expect_ai=1, expect_jpg=1, tol_px=1, pairs=None):
     folder = Path(folder)
     files = sorted(p for p in folder.rglob("*") if p.is_file())
     ais = [p for p in files if p.suffix.lower() == ".ai"]
@@ -125,12 +157,32 @@ def check_package(folder, dpi=300, expect_ai=1, expect_jpg=1, tol_px=1):
             {"rule": "分层、刀线层、对象逐元素检查", "status": "manual", "detail": "要在 Illustrator 里重开核对，脚本看不到 AI 图层"},
         ]
         ai_reports.append(info)
-    ref = ai_reports[0].get("artboard_mm") if ai_reports else None
-    for j in jpgs:
+    # Never infer correspondence from filename order or matching dimensions.
+    resolved = []
+    multi = len(ais) != 1 or any(r.get("pages", 1) != 1 for r in ai_reports)
+    if pairs is not None:
+        try:
+            resolved = validate_pairs(pairs, folder, ais, jpgs, ai_reports)
+            checks.append({"rule": "显式配对覆盖全部画板与 JPG", "status": "ok", "detail": str(len(resolved))})
+        except ValueError as e:
+            checks.append({"rule": "显式配对覆盖全部画板与 JPG", "status": "fail", "detail": str(e)})
+    elif multi:
+        checks.append({"rule": "多画板/多 AI 必须显式配对", "status": "fail", "detail": "提供 --pairs；不按尺寸或排序猜配对"})
+    elif ais:
+        resolved = [(j, ais[0], 0) for j in jpgs]
+    for j, a, page in resolved:
+        ref = read_ai(a, page=page).get("artboard_mm")
         if ref:
-            jpg_reports.append(check_jpg(j, ref, dpi, tol_px))
+            report = check_jpg(j, ref, dpi, tol_px)
+            report["pair"] = {"ai": a.relative_to(folder).as_posix(), "page": page,
+                              "jpg": j.relative_to(folder).as_posix()}
+            report["checks"].append({"rule": "画板内容与 JPG 对应", "status": "manual",
+                                     "detail": "尺寸相同不能证明内容相同；人工逐页核对"})
+            jpg_reports.append(report)
         else:
             jpg_reports.append({"file": j.name, "checks": [{"rule": "画板尺寸", "status": "manual", "detail": "没有可读的 AI 画板，用 jpg --artboard 手动核"}]})
+    if not resolved:
+        jpg_reports = [{"file": j.relative_to(folder).as_posix(), "checks": [{"rule": "画板配对", "status": "manual", "detail": "无有效完整配对，未核 JPG 像素"}]} for j in jpgs]
     every = checks + [c for r in ai_reports + jpg_reports for c in r["checks"]]
     return {"folder": folder.name, "dpi": dpi, "package_checks": checks, "ai": ai_reports, "jpg": jpg_reports,
             "summary": {s: sum(1 for c in every if c["status"] == s) for s in ("ok", "warn", "fail", "manual")},
@@ -142,12 +194,17 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("calc"); c.add_argument("artboard"); c.add_argument("--dpi", type=int, default=300)
     j = sub.add_parser("jpg"); j.add_argument("jpg"); j.add_argument("--artboard"); j.add_argument("--from-ai")
+    j.add_argument("--page", type=int, default=0, help="--from-ai 的零基页码")
     j.add_argument("--box", default="mediabox"); j.add_argument("--dpi", type=int, default=300); j.add_argument("--tol", type=int, default=1)
     mf = sub.add_parser("manifest", help="列出文件夹内文件名、字节数、SHA-256，供搬运前后核对")
     mf.add_argument("folder")
     p = sub.add_parser("package"); p.add_argument("folder"); p.add_argument("--dpi", type=int, default=300)
     p.add_argument("--expect-ai", type=int, default=1); p.add_argument("--expect-jpg", type=int, default=1); p.add_argument("--tol", type=int, default=1)
-    for s in (j, p):
+    p.add_argument("--pairs", help="JSON 数组，每项 ai/page/jpg；路径相对外发目录，页码零基")
+    ai = sub.add_parser("ai", help="读指定 AI/PDF 画板")
+    ai.add_argument("file"); ai.add_argument("--page", type=int, default=0)
+    ai.add_argument("--box", choices=("mediabox", "cropbox", "trimbox", "bleedbox", "artbox"), default="mediabox")
+    for s in (j, p, ai):
         s.add_argument("--json")
     a = ap.parse_args(argv)
     try:
@@ -162,17 +219,23 @@ def main(argv=None):
             print(json.dumps([{"name": x.name, "bytes": x.stat().st_size, "sha256": sha256(x).upper()} for x in fs],
                              ensure_ascii=False, indent=2))
             return 0
-        if a.cmd == "jpg":
+        if a.cmd == "ai":
+            r = read_ai(a.file, page=a.page, box=a.box)
+            statuses = []
+        elif a.cmd == "jpg":
             if a.artboard:
                 ab = parse_wh(a.artboard)
             elif a.from_ai:
-                ab = read_ai(a.from_ai, box=a.box)["artboard_mm"]
+                ab = read_ai(a.from_ai, page=a.page, box=a.box)["artboard_mm"]
             else:
                 raise ValueError("要给 --artboard 或 --from-ai")
             r = check_jpg(a.jpg, ab, a.dpi, a.tol)
             statuses = [x["status"] for x in r["checks"]]
         else:
-            r = check_package(a.folder, a.dpi, a.expect_ai, a.expect_jpg, a.tol)
+            pairs = json.loads(Path(a.pairs).read_text(encoding="utf-8")) if a.pairs else None
+            if a.pairs and not isinstance(pairs, list):
+                raise ValueError("--pairs 必须是 JSON 数组，不能为 null 或对象")
+            r = check_package(a.folder, a.dpi, a.expect_ai, a.expect_jpg, a.tol, pairs=pairs)
             statuses = [x["status"] for x in r["package_checks"]] + [x["status"] for y in r["ai"] + r["jpg"] for x in y["checks"]]
     except Exception as e:  # noqa: BLE001
         print(f"错误：{e}", file=sys.stderr)

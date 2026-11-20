@@ -31,3 +31,28 @@ python scripts/check_delivery.py package 外发文件夹 --json 交付核对.jso
 
 ## 5. 交付说明
 写清：文件名、画板 mm、JPG 像素和 DPI、AI 转曲状态（字体数）、谁做了技术/审美复核（AI 检查写“AI 复核，待人工确认”）、未检项。放行只能由技术员和审美员签。
+
+## 多画板显式配对（v1.1）
+
+页码为 **零基**：第一画板 `0`，第二画板 `1`。越界拒绝，不截断到末页。
+
+```sh
+python scripts/check_delivery.py ai 外发.ai --page 1
+python scripts/check_delivery.py jpg 第二画板.jpg --from-ai 外发.ai --page 1
+python scripts/check_delivery.py package 外发文件夹 --expect-jpg 2 --pairs 配对.json
+```
+
+配对文件放在外发目录之外，格式如下（相对外发目录，路径用 `/`）：
+
+```json
+[
+  {"ai": "外发.ai", "page": 0, "jpg": "第一画板.jpg"},
+  {"ai": "外发.ai", "page": 1, "jpg": "第二画板.jpg"}
+]
+```
+
+多 AI 或多画板必须显式映射；每个 AI 画板、每张 JPG 恰好出现一次。
+缺项、重复、越界、无效路径或尺寸不符均失败，不按文件排序或尺寸猜配对。
+单 AI 单画板保留旧用法。映射检查失败时不继续进行未配对 JPG 的尺寸检查。
+**同尺寸不代表同内容**：即使数字检查通过，也必须人工逐页核对图文对应。
+返回 0 仍不是印刷放行；PDF 兼容信息和 Illustrator 标记不是原生 AI 完整性的证明。
